@@ -250,21 +250,28 @@ class EmployeeController extends Controller
 
         try {
             $summary = $import->import($request->file('file')->getRealPath(), false);
+            $created = (int) ($summary['created'] ?? 0);
+            $updated = (int) ($summary['updated'] ?? 0);
+            $skipped = (int) ($summary['skipped'] ?? 0);
+            $failed = (int) ($summary['failed'] ?? 0);
+            $total = (int) ($summary['total'] ?? 0);
 
             return response()->json([
                 'message' => sprintf(
-                    'Imported %d, skipped %d, failed %d of %d row(s).',
-                    $summary['created'],
-                    $summary['skipped'],
-                    $summary['failed'],
-                    $summary['total']
+                    'Created %d, updated %d, skipped %d, failed %d of %d row(s).',
+                    $created,
+                    $updated,
+                    $skipped,
+                    $failed,
+                    $total
                 ),
-                'created' => $summary['created'],
-                'skipped' => $summary['skipped'],
-                'failed' => $summary['failed'],
-                'total' => $summary['total'],
+                'created' => $created,
+                'updated' => $updated,
+                'skipped' => $skipped,
+                'failed' => $failed,
+                'total' => $total,
                 'details' => $summary['details'],
-            ], $summary['failed'] > 0 && $summary['created'] === 0 ? 422 : 200);
+            ], $failed > 0 && ($created + $updated) === 0 ? 422 : 200);
         } catch (\Throwable $e) {
             Log::error('Employee Excel import failed', ['error' => $e->getMessage()]);
 

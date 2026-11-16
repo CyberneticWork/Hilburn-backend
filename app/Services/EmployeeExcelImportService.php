@@ -114,6 +114,7 @@ class EmployeeExcelImportService
         $summary = [
             'total' => count($employees),
             'created' => 0,
+            'updated' => 0,
             'skipped' => 0,
             'failed' => 0,
             'details' => [],
@@ -123,22 +124,40 @@ class EmployeeExcelImportService
             $label = $payload['meta']['display_name'] ?: $payload['meta']['column'];
 
             try {
-                if ($this->employeeExists($payload)) {
-                    $summary['skipped']++;
-                    $summary['details'][] = [
-                        'status' => 'skipped',
-                        'name' => $label,
-                        'reason' => 'Employee already exists (NIC or Attendance No)',
-                    ];
+                if (!empty($payload['meta']['error'])) {
+                    throw new \RuntimeException((string) $payload['meta']['error']);
+                }
+
+                $existing = $this->findExistingEmployee($payload);
+
+                if ($dryRun) {
+                    if ($existing) {
+                        $summary['updated']++;
+                        $summary['details'][] = [
+                            'status' => 'dry-run-update',
+                            'name' => $label,
+                            'reason' => 'Would update existing employee',
+                        ];
+                    } else {
+                        $summary['created']++;
+                        $summary['details'][] = [
+                            'status' => 'dry-run',
+                            'name' => $label,
+                            'reason' => 'Would create employee',
+                        ];
+                    }
                     continue;
                 }
 
-                if ($dryRun) {
-                    $summary['created']++;
+                if ($existing) {
+                    DB::transaction(function () use ($payload, $existing) {
+                        $this->updateEmployeeRecord($existing, $payload);
+                    });
+                    $summary['updated']++;
                     $summary['details'][] = [
-                        'status' => 'dry-run',
+                        'status' => 'updated',
                         'name' => $label,
-                        'reason' => 'Would create employee',
+                        'reason' => 'Updated existing employee (matched NIC or Attendance No)',
                     ];
                     continue;
                 }
@@ -190,12 +209,13 @@ class EmployeeExcelImportService
 
     private function buildEmployeePayload(string $column, string $headerName): array
     {
-        $attendanceNo = $this->cell($column, 'attendance_no');
+        $attendanceNo = $this->normalizeAttendanceNo($this->cell($column, 'attendance_no'));
         $displayName = $this->cell($column, 'display_name') ?: $headerName;
         $fullName = $this->cell($column, 'full_name') ?: $displayName;
         $nic = $this->normalizeNic($this->cell($column, 'nic'));
         $epf = $this->cell($column, 'epf') ?: ('NO-EPF-' . $attendanceNo);
-        $email = $this->cell($column, 'email') ?: $this->generateImportEmail($attendanceNo, $displayName);
+        $email = $this->sanitizeEmail($this->cell($column, 'email'))
+            ?: $this->generateImportEmail($attendanceNo, $displayName);
         $employmentStatus = $this->cell($column, 'employment_status') ?: 'Permanent';
         $designationName = $this->cell($column, 'designation') ?: 'Trainee';
         $companyCode = strtoupper($this->cell($column, 'company_code') ?: 'UNASSIGNED');
@@ -234,11 +254,15 @@ class EmployeeExcelImportService
 
         $spouseName = $this->cell($column, 'spouse_name');
         $spouse = null;
-        if ($spouseName !== '') {
+        if ($this->looksLikePersonName($spouseName)) {
             $spouseDob = $this->parseDate($this->cell($column, 'spouse_dob'));
+            $spouseTitle = $this->cell($column, 'spouse_title');
+            if (!$this->looksLikeTitle($spouseTitle)) {
+                $spouseTitle = null;
+            }
             $spouse = [
                 'type' => $this->cell($column, 'spouse_relationship') ?: 'Spouse',
-                'title' => $this->cell($column, 'spouse_title') ?: null,
+                'title' => $spouseTitle,
                 'name' => $spouseName,
                 'nic' => $this->normalizeNic($this->cell($column, 'spouse_nic')) ?: null,
                 'dob' => $spouseDob,
@@ -260,7 +284,7 @@ class EmployeeExcelImportService
                 'gender' => $this->normalizeGender($this->cell($column, 'gender')),
                 'religion' => trim($this->cell($column, 'religion')) ?: null,
                 'countryOfBirth' => $this->cell($column, 'country_of_birth') ?: 'Sri Lanka',
-                'employmentStatus' => $this->resolveEmploymentTypeId($employmentStatus),
+                'employmentStatusLabel' => $employmentStatus,
                 'nameWithInitial' => $this->cell($column, 'name_with_initials') ?: $fullName,
                 'fullName' => $fullName,
                 'displayName' => $displayName,
@@ -344,7 +368,11 @@ class EmployeeExcelImportService
             $spouseRecord = spouse::create($personal['spouse']);
         }
 
-        $isProbation = strtolower($org['employmentStatusLabel']) === 'probation';
+        $employmentStatusLabel = $personal['employmentStatusLabel']
+            ?? $org['employmentStatusLabel']
+            ?? 'Permanent';
+        $employmentTypeId = $this->resolveEmploymentTypeId($employmentStatusLabel);
+        $isProbation = strtolower($employmentStatusLabel) === 'probation';
 
         $orgAssignment = organization_assignment::create([
             'company_id' => $company->id,
@@ -355,8 +383,8 @@ class EmployeeExcelImportService
             'date_of_joining' => $org['dateOfJoined'],
             'day_off' => $org['dayOff'],
             'probationary_period' => $isProbation,
-            'training_period' => strtolower($org['employmentStatusLabel']) === 'training',
-            'contract_period' => strtolower($org['employmentStatusLabel']) === 'contract',
+            'training_period' => strtolower($employmentStatusLabel) === 'training',
+            'contract_period' => strtolower($employmentStatusLabel) === 'contract',
             'is_active' => true,
         ]);
 
@@ -374,7 +402,7 @@ class EmployeeExcelImportService
             'display_name' => $personal['displayName'],
             'marital_status' => strtolower($personal['maritalStatus']),
             'is_active' => true,
-            'employment_type_id' => $personal['employmentStatus'],
+            'employment_type_id' => $employmentTypeId,
             'organization_assignment_id' => $orgAssignment->id,
             'spouse_id' => $spouseRecord?->id,
             'email' => $address['email'],
@@ -446,16 +474,245 @@ class EmployeeExcelImportService
         ]);
     }
 
-    private function employeeExists(array $payload): bool
+    private function findExistingEmployee(array $payload): ?employee
     {
         $nic = $payload['personal']['nicNumber'];
         $attendanceNo = $payload['personal']['attendanceEmpNo'];
+        $companyCode = strtoupper((string) ($payload['organization']['companyCode'] ?? ''));
+        $companyName = trim((string) ($payload['organization']['companyName'] ?? ''));
 
-        return employee::query()
+        $matches = employee::query()
+            ->with('organizationAssignment.company')
             ->where(function ($q) use ($nic, $attendanceNo) {
-                $q->where('nic', $nic)->orWhere('attendance_employee_no', $attendanceNo);
+                if ($nic !== '') {
+                    $q->where('nic', $nic);
+                }
+                if ($attendanceNo !== '') {
+                    $q->orWhere('attendance_employee_no', $attendanceNo);
+                }
             })
-            ->exists();
+            ->get();
+
+        if ($matches->isEmpty()) {
+            // Soft-deleted rows still block unique attendance/NIC — reclaim them.
+            $trashed = employee::onlyTrashed()
+                ->with('organizationAssignment.company')
+                ->where(function ($q) use ($nic, $attendanceNo) {
+                    if ($nic !== '') {
+                        $q->where('nic', $nic);
+                    }
+                    if ($attendanceNo !== '') {
+                        $q->orWhere('attendance_employee_no', $attendanceNo);
+                    }
+                })
+                ->get();
+
+            if ($trashed->isEmpty()) {
+                return null;
+            }
+
+            $match = $this->pickCompanyMatch($trashed, $companyCode, $companyName);
+            if ($match) {
+                $match->restore();
+                return $match->fresh(['organizationAssignment.company']);
+            }
+
+            throw new \RuntimeException(
+                "NIC or Attendance No already belongs to a deleted employee in another company."
+            );
+        }
+
+        $match = $this->pickCompanyMatch($matches, $companyCode, $companyName);
+        if ($match) {
+            return $match;
+        }
+
+        $other = $matches->first();
+        $otherCompany = $other?->organizationAssignment?->company?->company_code
+            ?: $other?->organizationAssignment?->company?->name
+            ?: 'another company';
+
+        throw new \RuntimeException(
+            "NIC or Attendance No already used by {$otherCompany}. Use a unique Attendance No / NIC."
+        );
+    }
+
+    private function pickCompanyMatch($matches, string $companyCode, string $companyName): ?employee
+    {
+        if ($matches->count() === 1 && $companyCode === 'UNASSIGNED' && $companyName === '') {
+            return $matches->first();
+        }
+
+        $matched = $matches->first(function (employee $emp) use ($companyCode, $companyName) {
+            $company = $emp->organizationAssignment?->company;
+            if (!$company) {
+                return true;
+            }
+            if ($companyCode !== '' && $companyCode !== 'UNASSIGNED'
+                && strtoupper((string) $company->company_code) === $companyCode) {
+                return true;
+            }
+            if ($companyName !== '' && $companyName !== 'YOUR COMPANY NAME'
+                && strcasecmp((string) $company->name, $companyName) === 0) {
+                return true;
+            }
+
+            return false;
+        });
+
+        if ($matched) {
+            return $matched;
+        }
+
+        // Single-tenant DBs: if only one match exists, update it.
+        if ($matches->count() === 1) {
+            return $matches->first();
+        }
+
+        return null;
+    }
+
+    private function updateEmployeeRecord(employee $employee, array $payload): void
+    {
+        $personal = $payload['personal'];
+        $address = $payload['address'];
+        $comp = $payload['compensation'];
+        $org = $payload['organization'];
+
+        $company = $this->resolveCompany($org['companyCode'], $org['companyName']);
+        $department = $this->resolveDepartment($company->id, $org['departmentName']);
+        $subDepartment = $department
+            ? $this->resolveSubDepartment($department->id, $org['subDepartmentName'])
+            : null;
+        $designation = $this->resolveDesignation($org['designationName']);
+        $employmentStatusLabel = $personal['employmentStatusLabel']
+            ?? $org['employmentStatusLabel']
+            ?? 'Permanent';
+        $employmentTypeId = $this->resolveEmploymentTypeId($employmentStatusLabel);
+        $isProbation = strtolower($employmentStatusLabel) === 'probation';
+
+        $orgAssignment = $employee->organizationAssignment;
+        if ($orgAssignment) {
+            $orgAssignment->update([
+                'company_id' => $company->id,
+                'department_id' => $department?->id,
+                'sub_department_id' => $subDepartment?->id,
+                'designation_id' => $designation->id,
+                'current_supervisor' => $org['currentSupervisor'],
+                'date_of_joining' => $org['dateOfJoined'],
+                'day_off' => $org['dayOff'],
+                'probationary_period' => $isProbation,
+                'training_period' => strtolower($employmentStatusLabel) === 'training',
+                'contract_period' => strtolower($employmentStatusLabel) === 'contract',
+                'is_active' => true,
+            ]);
+        } else {
+            $orgAssignment = organization_assignment::create([
+                'company_id' => $company->id,
+                'department_id' => $department?->id,
+                'sub_department_id' => $subDepartment?->id,
+                'designation_id' => $designation->id,
+                'current_supervisor' => $org['currentSupervisor'],
+                'date_of_joining' => $org['dateOfJoined'],
+                'day_off' => $org['dayOff'],
+                'probationary_period' => $isProbation,
+                'training_period' => strtolower($employmentStatusLabel) === 'training',
+                'contract_period' => strtolower($employmentStatusLabel) === 'contract',
+                'is_active' => true,
+            ]);
+        }
+
+        if (!empty($personal['spouse'])) {
+            if ($employee->spouse_id) {
+                spouse::where('id', $employee->spouse_id)->update($personal['spouse']);
+            } else {
+                $spouseRecord = spouse::create($personal['spouse']);
+                $employee->spouse_id = $spouseRecord->id;
+            }
+        }
+
+        $employee->update([
+            'title' => $personal['title'],
+            'attendance_employee_no' => $personal['attendanceEmpNo'],
+            'epf' => $personal['epfNo'],
+            'nic' => $personal['nicNumber'],
+            'dob' => $personal['dob'],
+            'gender' => strtolower($personal['gender']),
+            'religion' => $personal['religion'],
+            'country_of_birth' => $personal['countryOfBirth'],
+            'name_with_initials' => $personal['nameWithInitial'],
+            'full_name' => $personal['fullName'],
+            'display_name' => $personal['displayName'],
+            'marital_status' => strtolower($personal['maritalStatus']),
+            'is_active' => true,
+            'employment_type_id' => $employmentTypeId,
+            'organization_assignment_id' => $orgAssignment->id,
+            'email' => $address['email'],
+        ]);
+
+        app(EmployeeUserLinker::class)->ensureLogin(
+            $employee->fresh(),
+            (string) ($address['email'] ?? ''),
+            (string) ($personal['nicNumber'] ?? ''),
+            (string) ($personal['fullName'] ?? ''),
+        );
+
+        $contact = contact_detail::query()->where('employee_id', $employee->id)->first();
+        $contactPayload = [
+            'employee_id' => $employee->id,
+            'permanent_address' => $address['permanentAddress'],
+            'temporary_address' => $address['temporaryAddress'],
+            'email' => $address['email'],
+            'land_line' => $address['landLine'],
+            'mobile_line' => $address['mobileLine'],
+            'gn_division' => $address['gnDivision'],
+            'police_station' => $address['policeStation'],
+            'district' => $address['district'],
+            'province' => $address['province'],
+            'electoral_division' => $address['electoralDivision'],
+            'emg_relationship' => $address['emergencyContact']['relationship'],
+            'emg_name' => $address['emergencyContact']['contactName'],
+            'emg_address' => $address['emergencyContact']['contactAddress'],
+            'emg_tel' => $address['emergencyContact']['contactTel'],
+        ];
+        if ($contact) {
+            $contact->update($contactPayload);
+        } else {
+            contact_detail::create($contactPayload);
+        }
+
+        $compensation = compensation::query()->where('employee_id', $employee->id)->first();
+        $compensationPayload = [
+            'employee_id' => $employee->id,
+            'employee_category' => $org['employeeCategory'],
+            'basic_salary' => $comp['basicSalary'],
+            'monthly_bonus' => $comp['monthlyBonus'],
+            'sports_fund_percentage' => $comp['sportsFundPercentage'],
+            'staff_fund_amount' => $comp['staffFundAmount'],
+            'bank_name' => $comp['bankName'],
+            'branch_name' => $comp['branchName'],
+            'bank_account_no' => $comp['bankAccountNo'],
+            'account_holder_name' => $comp['accountHolderName'],
+            'secondary_emp' => $comp['secondaryEmp'],
+            'primary_emp_basic' => $comp['primaryEmploymentBasic'],
+            'enable_epf_etf' => $comp['enableEpfEtf'],
+            'ot_active' => $comp['otActive'],
+            'early_deduction' => $comp['earlyDeduction'],
+            'increment_active' => $comp['incrementActive'],
+            'active_nopay' => $comp['nopayActive'],
+            'ot_morning' => $comp['morningOt'],
+            'ot_evening' => $comp['eveningOt'],
+            'ot_morning_rate' => $comp['ot_morning_rate'],
+            'ot_night_rate' => $comp['ot_night_rate'],
+            'br1' => $comp['budgetaryReliefAllowance2015'],
+            'br2' => $comp['budgetaryReliefAllowance2016'],
+            'stamp' => $comp['stamp'],
+        ];
+        if ($compensation) {
+            $compensation->update($compensationPayload);
+        } else {
+            compensation::create($compensationPayload);
+        }
     }
 
     private function resolveCompany(string $companyCode, string $companyName): company
@@ -559,32 +816,76 @@ class EmployeeExcelImportService
 
         $employees = [];
         foreach ($this->rows as $rowNum => $row) {
-            if ((int) $rowNum <= 2) {
+            // Row 1 = keys. Row 2 may be human labels (template) OR real data
+            // when the label row was deleted — detect labels instead of always skipping.
+            if ((int) $rowNum <= 1) {
                 continue;
             }
             $this->rowFields = [];
             foreach ($indexToKey as $col => $key) {
                 $this->rowFields[$key] = trim((string) ($row[$col] ?? ''));
             }
-            $attendance = $this->rowFields['attendance_no'] ?? '';
+            $attendance = $this->normalizeAttendanceNo($this->rowFields['attendance_no'] ?? '');
+            $this->rowFields['attendance_no'] = $attendance;
             $nic = $this->rowFields['nic'] ?? '';
             $name = $this->rowFields['full_name'] ?? $this->rowFields['display_name'] ?? '';
             $companyCode = strtoupper($this->rowFields['company_code'] ?? '');
             if ($attendance === '' && $nic === '' && $name === '') {
                 continue;
             }
+            if ($this->isLabelRow($this->rowFields)) {
+                continue;
+            }
             if ($companyCode === 'YOURCODE' || ($this->rowFields['company_name'] ?? '') === 'YOUR COMPANY NAME') {
                 continue;
             }
-            $employees[] = $this->buildEmployeePayload('ROW', $name ?: $attendance);
+
+            try {
+                $employees[] = $this->buildEmployeePayload('ROW', $name ?: $attendance);
+            } catch (\Throwable $e) {
+                $employees[] = [
+                    'meta' => [
+                        'column' => 'ROW',
+                        'display_name' => $name ?: $attendance ?: ('Row ' . $rowNum),
+                        'error' => $e->getMessage(),
+                    ],
+                    'personal' => [
+                        'nicNumber' => $this->normalizeNic($nic),
+                        'attendanceEmpNo' => $attendance,
+                    ],
+                    'organization' => [
+                        'companyCode' => $companyCode ?: 'UNASSIGNED',
+                        'companyName' => $this->rowFields['company_name'] ?? $companyCode,
+                    ],
+                ];
+            }
         }
         $this->rowFields = null;
 
         if ($employees === []) {
-            throw new \RuntimeException('No employee rows found. Fill data from row 3 downward.');
+            throw new \RuntimeException('No employee rows found. Fill employee data from row 2/3 downward (do not leave only the sample row).');
         }
 
         return $employees;
+    }
+
+    private function isLabelRow(array $fields): bool
+    {
+        $attendance = strtolower(trim((string) ($fields['attendance_no'] ?? '')));
+        $nic = strtolower(trim((string) ($fields['nic'] ?? '')));
+        $title = strtolower(trim((string) ($fields['title'] ?? '')));
+        $fullName = strtolower(trim((string) ($fields['full_name'] ?? '')));
+
+        foreach ([$attendance, $nic, $title, $fullName] as $value) {
+            if ($value !== '' && (str_contains($value, '*') || str_contains($value, 'yyyy-mm-dd'))) {
+                return true;
+            }
+        }
+
+        return in_array($attendance, ['attendance no', 'attendance_no', 'emp no', 'employee no'], true)
+            || in_array($nic, ['nic', 'nic no', 'nic_no'], true)
+            || in_array($title, ['title'], true)
+            || in_array($fullName, ['full name', 'full_name'], true);
     }
 
     private function normalizeHeader(string $label): string
@@ -655,9 +956,27 @@ class EmployeeExcelImportService
 
         $value = str_replace('\\', '', $value);
 
-        foreach (['Y/m/d', 'Y-m-d', 'd/m/Y', 'm/d/Y'] as $format) {
+        // Prefer the unambiguous slash/dash order when day/month > 12.
+        $formats = ['Y/m/d', 'Y-m-d', 'd/m/Y', 'm/d/Y'];
+        if (preg_match('/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/', $value, $m)) {
+            $left = (int) $m[1];
+            $middle = (int) $m[2];
+            if ($middle > 12 && $left <= 12) {
+                $formats = ['Y/m/d', 'Y-m-d', 'm/d/Y', 'd/m/Y'];
+            } elseif ($left > 12 && $middle <= 12) {
+                $formats = ['Y/m/d', 'Y-m-d', 'd/m/Y', 'm/d/Y'];
+            } else {
+                // Ambiguous (both <= 12): Windows Excel exports are usually m/d/Y.
+                $formats = ['Y/m/d', 'Y-m-d', 'm/d/Y', 'd/m/Y'];
+            }
+        }
+
+        foreach ($formats as $format) {
             try {
-                return Carbon::createFromFormat($format, $value)->format('Y-m-d');
+                $parsed = Carbon::createFromFormat('!' . $format, $value);
+                if ($parsed !== false) {
+                    return $parsed->format('Y-m-d');
+                }
             } catch (\Throwable) {
             }
         }
@@ -749,5 +1068,59 @@ class EmployeeExcelImportService
         $slug = trim($slug, '.');
 
         return "{$attendanceNo}.{$slug}@import.local";
+    }
+
+    private function normalizeAttendanceNo(string $value): string
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return '';
+        }
+
+        // Excel sometimes yields "14.0" for numeric attendance numbers.
+        if (preg_match('/^\d+\.0+$/', $value)) {
+            return (string) (int) $value;
+        }
+
+        return preg_replace('/\s+/', '', $value) ?: $value;
+    }
+
+    private function sanitizeEmail(string $value): string
+    {
+        $value = strtolower(trim($value));
+        if ($value === '') {
+            return '';
+        }
+
+        // Common spreadsheet typo: "name@gmail com" / "name@domain lk"
+        $value = preg_replace('/\s+/', ' ', $value);
+        $value = preg_replace('/@([^@\s]+)\s+([a-z]{2,})/', '@$1.$2', $value);
+        $value = str_replace(' ', '', $value);
+
+        return $value;
+    }
+
+    private function looksLikePersonName(string $value): bool
+    {
+        $value = trim($value);
+        if ($value === '' || is_numeric($value)) {
+            return false;
+        }
+
+        $blocked = [
+            'married', 'single', 'divorced', 'widowed',
+            'male', 'female', 'other',
+            'mr', 'mrs', 'ms', 'dr',
+            'yes', 'no', 'n/a', 'na', '-',
+        ];
+
+        return !in_array(strtolower(rtrim($value, '.')), $blocked, true);
+    }
+
+    private function looksLikeTitle(string $value): bool
+    {
+        $value = strtolower(rtrim(trim($value), '.'));
+
+        return in_array($value, ['mr', 'mrs', 'ms', 'dr'], true);
     }
 }
