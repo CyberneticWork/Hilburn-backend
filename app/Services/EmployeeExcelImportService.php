@@ -220,14 +220,12 @@ class EmployeeExcelImportService
         $designationName = $this->cell($column, 'designation') ?: 'Trainee';
         $companyCode = strtoupper($this->cell($column, 'company_code') ?: 'UNASSIGNED');
         $companyName = $this->cell($column, 'company_name') ?: $companyCode;
-        $basicSalary = $this->parseMoney($this->cell($column, 'basic_salary'));
+        $salaryRaw = $this->cell($column, 'basic_salary');
+        $basicSalary = $this->parseMoney($salaryRaw);
+        $salaryProvided = trim($salaryRaw) !== '';
         $monthlyBonus = $this->parseMoney($this->cell($column, 'monthly_bonus'));
         $sportsFundPct = $this->parsePercentage($this->cell($column, 'sports_fund_percentage'));
         $staffFundAmount = $this->parseMoney($this->cell($column, 'staff_fund_amount'));
-
-        if ($basicSalary <= 0) {
-            throw new \RuntimeException("Basic salary is missing for {$displayName}");
-        }
 
         if ($nic === '') {
             throw new \RuntimeException("NIC is missing for {$displayName}");
@@ -274,6 +272,7 @@ class EmployeeExcelImportService
             'meta' => [
                 'column' => $column,
                 'display_name' => $displayName,
+                'salary_provided' => $salaryProvided,
             ],
             'personal' => [
                 'title' => $this->normalizeTitle($this->cell($column, 'title')),
@@ -355,6 +354,12 @@ class EmployeeExcelImportService
         $address = $payload['address'];
         $comp = $payload['compensation'];
         $org = $payload['organization'];
+
+        if ((float) ($comp['basicSalary'] ?? 0) <= 0) {
+            throw new \RuntimeException(
+                'Basic salary is required to create ' . ($payload['meta']['display_name'] ?? 'employee')
+            );
+        }
 
         $company = $this->resolveCompany($org['companyCode'], $org['companyName']);
         $department = $this->resolveDepartment($company->id, $org['departmentName']);
@@ -682,17 +687,29 @@ class EmployeeExcelImportService
         }
 
         $compensation = compensation::query()->where('employee_id', $employee->id)->first();
+        $salaryProvided = !empty($payload['meta']['salary_provided']);
+        $basicSalary = (float) ($comp['basicSalary'] ?? 0);
+        if (!$salaryProvided || $basicSalary <= 0) {
+            $basicSalary = (float) ($compensation?->basic_salary ?? 0);
+        }
+        if ($basicSalary <= 0) {
+            throw new \RuntimeException(
+                'Basic salary is missing for ' . ($payload['meta']['display_name'] ?? 'employee')
+                . '. Fill Basic Salary in Excel, or ensure the employee already has a salary on file.'
+            );
+        }
+
         $compensationPayload = [
             'employee_id' => $employee->id,
             'employee_category' => $org['employeeCategory'],
-            'basic_salary' => $comp['basicSalary'],
+            'basic_salary' => $basicSalary,
             'monthly_bonus' => $comp['monthlyBonus'],
             'sports_fund_percentage' => $comp['sportsFundPercentage'],
             'staff_fund_amount' => $comp['staffFundAmount'],
-            'bank_name' => $comp['bankName'],
-            'branch_name' => $comp['branchName'],
-            'bank_account_no' => $comp['bankAccountNo'],
-            'account_holder_name' => $comp['accountHolderName'],
+            'bank_name' => $comp['bankName'] ?: ($compensation?->bank_name),
+            'branch_name' => $comp['branchName'] ?: ($compensation?->branch_name),
+            'bank_account_no' => $comp['bankAccountNo'] ?: ($compensation?->bank_account_no),
+            'account_holder_name' => $comp['accountHolderName'] ?: ($compensation?->account_holder_name),
             'secondary_emp' => $comp['secondaryEmp'],
             'primary_emp_basic' => $comp['primaryEmploymentBasic'],
             'enable_epf_etf' => $comp['enableEpfEtf'],
@@ -721,10 +738,25 @@ class EmployeeExcelImportService
         $name = trim($companyName);
         $existing = null;
         if ($code !== '' && $code !== 'YOURCODE') {
-            $existing = company::query()->where('company_code', $code)->first();
+            $existing = company::query()
+                ->whereRaw('UPPER(TRIM(company_code)) = ?', [$code])
+                ->first();
         }
         if (!$existing && $name !== '' && $name !== 'YOUR COMPANY NAME') {
-            $existing = company::query()->where('name', $name)->first();
+            $existing = company::query()
+                ->whereRaw('LOWER(TRIM(name)) = ?', [strtolower($name)])
+                ->first();
+        }
+        // Allow close names like "Hilburn International College" vs "Hilburn College (PVT) LTD"
+        if (!$existing && $name !== '' && $name !== 'YOUR COMPANY NAME') {
+            $existing = company::query()
+                ->whereRaw('LOWER(name) like ?', ['%' . strtolower(strtok($name, ' ')) . '%'])
+                ->get()
+                ->first(function ($company) use ($name) {
+                    similar_text(strtolower($company->name), strtolower($name), $percent);
+
+                    return $percent >= 60;
+                });
         }
 
         if ($existing) {
