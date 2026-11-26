@@ -256,22 +256,39 @@ class EmployeeController extends Controller
             $failed = (int) ($summary['failed'] ?? 0);
             $total = (int) ($summary['total'] ?? 0);
 
+            $message = sprintf(
+                'Created %d, updated %d, skipped %d, failed %d of %d row(s).',
+                $created,
+                $updated,
+                $skipped,
+                $failed,
+                $total
+            );
+
+            if ($failed > 0) {
+                $failReasons = collect($summary['details'] ?? [])
+                    ->where('status', 'failed')
+                    ->take(5)
+                    ->map(fn ($row) => trim(($row['name'] ?? 'Row') . ': ' . ($row['reason'] ?? 'failed')))
+                    ->filter()
+                    ->values()
+                    ->all();
+                if ($failReasons !== []) {
+                    $message .= ' ' . implode(' | ', $failReasons);
+                }
+            }
+
+            // Always 200 when rows were processed so the UI can show per-row reasons
+            // (422 made axios throw and hid the detail list).
             return response()->json([
-                'message' => sprintf(
-                    'Created %d, updated %d, skipped %d, failed %d of %d row(s).',
-                    $created,
-                    $updated,
-                    $skipped,
-                    $failed,
-                    $total
-                ),
+                'message' => $message,
                 'created' => $created,
                 'updated' => $updated,
                 'skipped' => $skipped,
                 'failed' => $failed,
                 'total' => $total,
                 'details' => $summary['details'],
-            ], $failed > 0 && ($created + $updated) === 0 ? 422 : 200);
+            ], 200);
         } catch (\Throwable $e) {
             Log::error('Employee Excel import failed', ['error' => $e->getMessage()]);
 

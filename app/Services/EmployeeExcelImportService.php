@@ -355,10 +355,10 @@ class EmployeeExcelImportService
         $comp = $payload['compensation'];
         $org = $payload['organization'];
 
+        // Blank Basic Salary in Excel is allowed on import (saved as 0; set real salary in HR later).
         if ((float) ($comp['basicSalary'] ?? 0) <= 0) {
-            throw new \RuntimeException(
-                'Basic salary is required to create ' . ($payload['meta']['display_name'] ?? 'employee')
-            );
+            $comp['basicSalary'] = 0;
+            $payload['compensation'] = $comp;
         }
 
         $company = $this->resolveCompany($org['companyCode'], $org['companyName']);
@@ -690,13 +690,8 @@ class EmployeeExcelImportService
         $salaryProvided = !empty($payload['meta']['salary_provided']);
         $basicSalary = (float) ($comp['basicSalary'] ?? 0);
         if (!$salaryProvided || $basicSalary <= 0) {
+            // Keep existing salary when Excel left Basic Salary blank.
             $basicSalary = (float) ($compensation?->basic_salary ?? 0);
-        }
-        if ($basicSalary <= 0) {
-            throw new \RuntimeException(
-                'Basic salary is missing for ' . ($payload['meta']['display_name'] ?? 'employee')
-                . '. Fill Basic Salary in Excel, or ensure the employee already has a salary on file.'
-            );
         }
 
         $compensationPayload = [
