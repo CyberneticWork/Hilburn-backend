@@ -176,8 +176,8 @@ class EmployeeExcelImportService
                 $summary['failed']++;
                 $summary['details'][] = [
                     'status' => 'failed',
-                    'name' => $label,
-                    'reason' => $e->getMessage(),
+                    'name' => $this->cleanText($label),
+                    'reason' => $this->cleanText($e->getMessage()) ?: 'Import failed for this row.',
                 ];
             }
         }
@@ -850,7 +850,7 @@ class EmployeeExcelImportService
             }
             $this->rowFields = [];
             foreach ($indexToKey as $col => $key) {
-                $this->rowFields[$key] = trim((string) ($row[$col] ?? ''));
+                $this->rowFields[$key] = $this->cleanText($row[$col] ?? '');
             }
             $attendance = $this->normalizeAttendanceNo($this->rowFields['attendance_no'] ?? '');
             $this->rowFields['attendance_no'] = $attendance;
@@ -874,7 +874,7 @@ class EmployeeExcelImportService
                     'meta' => [
                         'column' => 'ROW',
                         'display_name' => $name ?: $attendance ?: ('Row ' . $rowNum),
-                        'error' => $e->getMessage(),
+                        'error' => $this->cleanText($e->getMessage()),
                     ],
                     'personal' => [
                         'nicNumber' => $this->normalizeNic($nic),
@@ -956,7 +956,7 @@ class EmployeeExcelImportService
     private function cell(string $column, string $field): string
     {
         if ($this->rowFields !== null) {
-            return trim((string) ($this->rowFields[$field] ?? ''));
+            return $this->cleanText($this->rowFields[$field] ?? '');
         }
 
         $row = self::FIELD_ROWS[$field] ?? null;
@@ -964,12 +964,47 @@ class EmployeeExcelImportService
             return '';
         }
 
-        return trim((string) ($this->rows[$row][$column] ?? ''));
+        return $this->cleanText($this->rows[$row][$column] ?? '');
+    }
+
+    /**
+     * Normalize spreadsheet text to safe UTF-8 and treat placeholder dashes as empty.
+     */
+    private function cleanText(mixed $value): string
+    {
+        if ($value === null) {
+            return '';
+        }
+
+        $text = trim((string) $value);
+        if ($text === '') {
+            return '';
+        }
+
+        // Excel often uses em/en dashes or N/A for blank cells.
+        $normalized = preg_replace('/^[\s\x{00A0}\x{2000}-\x{200B}\x{FEFF}]+|[\s\x{00A0}\x{2000}-\x{200B}\x{FEFF}]+$/u', '', $text) ?? $text;
+        $normalized = trim($normalized);
+        if (in_array($normalized, ['—', '–', '-', '−', 'n/a', 'N/A', 'NA', 'null', 'NULL', '#N/A', '#VALUE!'], true)) {
+            return '';
+        }
+
+        if (!mb_check_encoding($normalized, 'UTF-8')) {
+            $converted = @mb_convert_encoding($normalized, 'UTF-8', 'UTF-8, ISO-8859-1, Windows-1252');
+            $normalized = is_string($converted) ? $converted : '';
+        }
+
+        // Drop any remaining invalid UTF-8 so Laravel JSON responses never break.
+        $normalized = iconv('UTF-8', 'UTF-8//IGNORE', $normalized);
+        if ($normalized === false) {
+            return '';
+        }
+
+        return trim(preg_replace('/\s+/u', ' ', $normalized) ?? $normalized);
     }
 
     private function parseDate(?string $value): ?string
     {
-        $value = trim((string) $value);
+        $value = $this->cleanText($value);
         if ($value === '') {
             return null;
         }
@@ -978,6 +1013,7 @@ class EmployeeExcelImportService
             try {
                 return \PhpOffice\PhpSpreadsheet\Shared\Date::excelToDateTimeObject((float) $value)->format('Y-m-d');
             } catch (\Throwable) {
+                return null;
             }
         }
 
@@ -1008,7 +1044,11 @@ class EmployeeExcelImportService
             }
         }
 
-        return Carbon::parse($value)->format('Y-m-d');
+        try {
+            return Carbon::parse($value)->format('Y-m-d');
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     private function parseMoney(?string $value): float
