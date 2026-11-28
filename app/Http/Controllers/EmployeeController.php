@@ -71,7 +71,12 @@ class EmployeeController extends Controller
             'organizationAssignment.department',
             'organizationAssignment.subDepartment',
             'organizationAssignment.designation',
-        ])->excludeContract()->get();
+        ])
+            ->where(function ($q) {
+                $q->where('is_active', 1)->orWhere('is_active', true);
+            })
+            ->excludeContract()
+            ->get();
         return response()->json($employees, 200);
     }
 
@@ -119,6 +124,7 @@ class EmployeeController extends Controller
         $perPage = $request->input('per_page', 10);
         $page = $request->input('page', 1);
         $search = $request->input('search', '');
+        $status = strtolower((string) $request->input('status', 'active'));
 
         $query = employee::with([
             'employmentType:id,name',
@@ -139,6 +145,16 @@ class EmployeeController extends Controller
             'organization_assignment_id',
             'nic'
         ])->excludeContract();
+
+        if ($status === 'inactive') {
+            $query->where(function ($q) {
+                $q->where('is_active', 0)->orWhere('is_active', false);
+            });
+        } elseif ($status !== 'all') {
+            $query->where(function ($q) {
+                $q->where('is_active', 1)->orWhere('is_active', true);
+            });
+        }
 
         if ($search) {
             $query->where(function ($q) use ($search) {
@@ -182,6 +198,9 @@ class EmployeeController extends Controller
     public function search(Request $request)
     {
         $search = $request->input('search', '');
+        $hasOrganizationFilter = $request->filled('company_id')
+            || $request->filled('department_id')
+            || $request->filled('sub_department_id');
 
         $query = employee::query()
             ->select([
@@ -191,10 +210,28 @@ class EmployeeController extends Controller
                 'profile_photo_path',
                 'epf',
                 'attendance_employee_no',
-                'nic'
+                'nic',
+                'organization_assignment_id',
             ])
-            ->excludeContract()
-            ->limit(10);
+            ->where(function ($q) {
+                $q->where('is_active', 1)->orWhere('is_active', true);
+            })
+            ->excludeContract();
+
+        if ($hasOrganizationFilter) {
+            $query
+                ->whereHas('organizationAssignment', function ($assignmentQuery) use ($request) {
+                    foreach (['company_id', 'department_id', 'sub_department_id'] as $filter) {
+                        if ($request->filled($filter)) {
+                            $assignmentQuery->where($filter, $request->input($filter));
+                        }
+                    }
+                })
+                ->with('organizationAssignment:id,company_id,department_id,sub_department_id')
+                ->orderBy('full_name');
+        } else {
+            $query->limit(10);
+        }
 
         if ($search) {
             $query->where(function ($q) use ($search) {
@@ -617,9 +654,11 @@ class EmployeeController extends Controller
                 'training_period_to' => empty($organization['trainingTo']) ? null : $organization['trainingTo'],
                 'contract_period_from' => empty($organization['contractFrom']) ? null : $organization['contractFrom'],
                 'contract_period_to' => empty($organization['contractTo']) ? null : $organization['contractTo'],
-                'date_of_resigning' => empty($organization['confirmationDate']) ? null : $organization['confirmationDate'],
-                'is_active' => (bool) ($organization['currentStatus'] ?? true),
+                'date_of_resigning' => empty($organization['resignationDate']) ? null : $organization['resignationDate'],
+                'is_active' => $this->resolveEmployeeActiveStatus($organization['currentStatus'] ?? 1),
             ] + $this->locationAttributes($organization, $companyId));
+
+            $isActive = $this->resolveEmployeeActiveStatus($organization['currentStatus'] ?? 1);
 
             // Create employee record
             $employee = employee::create([
@@ -635,7 +674,7 @@ class EmployeeController extends Controller
                 'full_name' => $personal['fullName'],
                 'display_name' => $personal['displayName'],
                 'marital_status' => strtolower($personal['maritalStatus']),
-                'is_active' => true,
+                'is_active' => $isActive,
                 'employment_type_id' => $personal['employmentStatus'],
                 'organization_assignment_id' => $orgAssignment->id,
                 'spouse_id' => $spouse ? $spouse->id : null,
@@ -825,6 +864,28 @@ class EmployeeController extends Controller
         if (is_array($organization) && !empty($organization['location'])) {
             app(CompanyLocationService::class)->ensureSchema();
         }
+    }
+
+    /**
+     * Normalize Active/Inactive from employee master (1/0, true/false, "Active"/"Inactive").
+     */
+    private function resolveEmployeeActiveStatus($value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_numeric($value)) {
+            return (int) $value === 1;
+        }
+        $normalized = strtolower(trim((string) $value));
+        if ($normalized === '' || $normalized === 'active' || $normalized === 'true' || $normalized === 'yes') {
+            return true;
+        }
+        if (in_array($normalized, ['0', 'inactive', 'false', 'no'], true)) {
+            return false;
+        }
+
+        return (bool) $value;
     }
 
     // Older frontends never send `location`; leave the stored location untouched for them.
@@ -1413,10 +1474,14 @@ class EmployeeController extends Controller
                     'training_period_to' => empty($organization['trainingTo']) ? null : $organization['trainingTo'],
                     'contract_period_from' => empty($organization['contractFrom']) ? null : $organization['contractFrom'],
                     'contract_period_to' => empty($organization['contractTo']) ? null : $organization['contractTo'],
-                    'date_of_resigning' => empty($organization['confirmationDate']) ? null : $organization['confirmationDate'],
-                    'is_active' => (bool) ($organization['currentStatus'] ?? true),
+                    'date_of_resigning' => empty($organization['resignationDate']) ? null : $organization['resignationDate'],
+                    'is_active' => $this->resolveEmployeeActiveStatus($organization['currentStatus'] ?? $employee->is_active ?? 1),
                 ] + $this->locationAttributes($organization, $companyId));
             }
+
+            $isActive = $this->resolveEmployeeActiveStatus(
+                $organization['currentStatus'] ?? $employee->is_active ?? 1
+            );
 
             // Update employee record
             $employee->update([
@@ -1432,7 +1497,7 @@ class EmployeeController extends Controller
                 'full_name' => $personal['fullName'],
                 'display_name' => $personal['displayName'],
                 'marital_status' => strtolower($personal['maritalStatus']),
-                'is_active' => true,
+                'is_active' => $isActive,
                 'employment_type_id' => $personal['employmentStatus'],
                 'profile_photo_path' => $profilePicturePath,
             ]);

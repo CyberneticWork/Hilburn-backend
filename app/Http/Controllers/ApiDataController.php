@@ -173,11 +173,27 @@ class ApiDataController extends Controller
             return response()->json(['message' => 'Company not found'], 404);
         }
 
-        $employees = employee::where('is_active', 1)
-            ->excludeContract()
+        // Roster company-wise needs every staff member under the company
+        // (including contract / unset active flags). Soft-deleted rows stay hidden.
+        $employees = employee::query()
+            ->where(function ($q) {
+                $q->where('is_active', 1)
+                    ->orWhere('is_active', true)
+                    ->orWhereNull('is_active');
+            })
             ->whereHas('organizationAssignment', function ($query) use ($id) {
                 $query->where('company_id', $id);
-            })->get(['id', 'full_name', 'attendance_employee_no', 'epf', 'nic']);
+            })
+            ->orderBy('full_name')
+            ->get([
+                'id',
+                'full_name',
+                'name_with_initials',
+                'attendance_employee_no',
+                'epf',
+                'nic',
+                'organization_assignment_id',
+            ]);
 
         return response()->json($employees, 200);
     }

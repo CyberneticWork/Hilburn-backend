@@ -106,6 +106,9 @@ class PmsController extends Controller
         }
 
         $query = employee::with('organizationAssignment')
+            ->where(function ($q) {
+                $q->where('is_active', 1)->orWhere('is_active', true);
+            })
             ->whereHas('organizationAssignment', function ($q) use ($companyId, $departmentId) {
                 $q->where('company_id', $companyId);
                 if ($departmentId) {
@@ -137,6 +140,9 @@ class PmsController extends Controller
         }
 
         $employees = employee::with(['organizationAssignment.department', 'organizationAssignment.company'])
+            ->where(function ($q) {
+                $q->where('is_active', 1)->orWhere('is_active', true);
+            })
             ->where('attendance_employee_no', 'like', "%{$search}%")
             ->select('id', 'full_name', 'attendance_employee_no')
             ->limit(10)

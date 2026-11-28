@@ -66,6 +66,12 @@ class AuthController extends Controller
             return $this->invalidCredentials();
         }
 
+        if ($response = $this->rejectInactiveEmployee($user)) {
+            $this->hitLoginAttempts($throttleKey);
+
+            return $response;
+        }
+
         $this->clearLoginAttempts($throttleKey);
 
         return $this->issueJwtResponse($user);
@@ -219,11 +225,42 @@ class AuthController extends Controller
             return $this->invalidCredentials();
         }
 
+        if ($response = $this->rejectInactiveEmployee($user)) {
+            return $response;
+        }
+
         $user->otp = null;
         $user->otp_expires_at = null;
         $user->save();
 
         return $this->issueJwtResponse($user);
+    }
+
+    private function rejectInactiveEmployee(User $user): ?JsonResponse
+    {
+        if (!$user->employee_id) {
+            return null;
+        }
+
+        $employee = $user->relationLoaded('employee')
+            ? $user->employee
+            : $user->employee()->first();
+
+        if (!$employee) {
+            return null;
+        }
+
+        $active = $employee->is_active === true
+            || $employee->is_active === 1
+            || $employee->is_active === '1';
+
+        if ($active) {
+            return null;
+        }
+
+        return response()->json([
+            'message' => 'This employee account is inactive. Contact HR if you need access.',
+        ], 403);
     }
 
     public function changePassword(Request $request)

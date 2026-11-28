@@ -26,6 +26,20 @@ class AuthenticateJwtOrSanctum
             return response()->json(['message' => 'Unauthenticated.'], 401);
         }
 
+        $user = $request->user();
+        if ($user instanceof User && $user->employee_id) {
+            $employee = $user->relationLoaded('employee')
+                ? $user->employee
+                : $user->employee()->first();
+            $active = $employee
+                && ($employee->is_active === true || $employee->is_active === 1 || $employee->is_active === '1');
+            if ($employee && !$active) {
+                return response()->json([
+                    'message' => 'This employee account is inactive. Contact HR if you need access.',
+                ], 403);
+            }
+        }
+
         return $next($request);
     }
 

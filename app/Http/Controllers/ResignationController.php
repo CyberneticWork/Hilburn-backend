@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use Exception;
 use App\Models\loans;
 use App\Models\employee;
+use App\Models\organization_assignment;
 use App\Models\Resignation;
 use App\Models\User;
 use App\Models\Notification;
@@ -183,6 +184,23 @@ class ResignationController extends Controller
             $resignation->update($update);
             $employee = employee::findOrFail($resignation->employee_id);
             $employee->update(['is_active' => false]);
+
+            $resignDate = $request->input('last_working_day')
+                ?? $resignation->last_working_day
+                ?? $resignation->resigning_date
+                ?? now()->toDateString();
+            $resignReason = $request->notes
+                ?? $resignation->resignation_reason
+                ?? null;
+
+            if ($employee->organization_assignment_id) {
+                organization_assignment::where('id', $employee->organization_assignment_id)->update([
+                    'is_active' => false,
+                    'date_of_resigning' => $resignDate,
+                    'resigned_reason' => $resignReason,
+                ]);
+            }
+
             LeaveNotificationService::notifyEmployee((int) $resignation->employee_id, 'Resignation approved', 'HR approved your resignation request.', [
                 'type' => 'resignation',
                 'resignation_id' => $resignation->id,
