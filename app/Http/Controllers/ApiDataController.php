@@ -149,19 +149,75 @@ class ApiDataController extends Controller
         return response()->json($subDepartment, 200);
     }
 
-    //get employee based on sub department
-    public function employeesBySubDepartment($id)
+    /**
+     * Active staff for roster pickers (includes contract; hides only explicitly inactive).
+     */
+    private function rosterEmployeesQuery()
+    {
+        return employee::query()
+            ->where(function ($q) {
+                $q->where('is_active', 1)
+                    ->orWhere('is_active', true)
+                    ->orWhereNull('is_active');
+            })
+            ->orderBy('full_name');
+    }
+
+    private function rosterEmployeeColumns(): array
+    {
+        return [
+            'id',
+            'full_name',
+            'name_with_initials',
+            'attendance_employee_no',
+            'epf',
+            'nic',
+            'organization_assignment_id',
+        ];
+    }
+
+    public function employeesByDepartment(Request $request, $id)
+    {
+        $department = departments::find($id);
+        if (!$department) {
+            return response()->json(['message' => 'Department not found'], 404);
+        }
+
+        $companyId = $request->query('company_id');
+
+        $employees = $this->rosterEmployeesQuery()
+            ->whereHas('organizationAssignment', function ($query) use ($id, $companyId) {
+                $query->where('department_id', $id);
+                if ($companyId) {
+                    $query->where('company_id', $companyId);
+                }
+            })
+            ->get($this->rosterEmployeeColumns());
+
+        return response()->json($employees, 200);
+    }
+
+    public function employeesBySubDepartment(Request $request, $id)
     {
         $subDepartment = sub_departments::find($id);
         if (!$subDepartment) {
             return response()->json(['message' => 'Sub-department not found'], 404);
         }
 
-        $employees = employee::where('is_active', 1)
-            ->excludeContract()
-            ->whereHas('organizationAssignment', function ($query) use ($id) {
+        $companyId = $request->query('company_id');
+        $departmentId = $request->query('department_id');
+
+        $employees = $this->rosterEmployeesQuery()
+            ->whereHas('organizationAssignment', function ($query) use ($id, $companyId, $departmentId) {
                 $query->where('sub_department_id', $id);
-            })->get(['id', 'full_name']);
+                if ($departmentId) {
+                    $query->where('department_id', $departmentId);
+                }
+                if ($companyId) {
+                    $query->where('company_id', $companyId);
+                }
+            })
+            ->get($this->rosterEmployeeColumns());
 
         return response()->json($employees, 200);
     }
@@ -175,25 +231,11 @@ class ApiDataController extends Controller
 
         // Roster company-wise needs every staff member under the company
         // (including contract / unset active flags). Soft-deleted rows stay hidden.
-        $employees = employee::query()
-            ->where(function ($q) {
-                $q->where('is_active', 1)
-                    ->orWhere('is_active', true)
-                    ->orWhereNull('is_active');
-            })
+        $employees = $this->rosterEmployeesQuery()
             ->whereHas('organizationAssignment', function ($query) use ($id) {
                 $query->where('company_id', $id);
             })
-            ->orderBy('full_name')
-            ->get([
-                'id',
-                'full_name',
-                'name_with_initials',
-                'attendance_employee_no',
-                'epf',
-                'nic',
-                'organization_assignment_id',
-            ]);
+            ->get($this->rosterEmployeeColumns());
 
         return response()->json($employees, 200);
     }

@@ -214,9 +214,13 @@ class EmployeeController extends Controller
                 'organization_assignment_id',
             ])
             ->where(function ($q) {
-                $q->where('is_active', 1)->orWhere('is_active', true);
-            })
-            ->excludeContract();
+                $q->where('is_active', 1)->orWhere('is_active', true)->orWhereNull('is_active');
+            });
+
+        // Roster / org pickers need every staff under the filter (including contract).
+        if (!$hasOrganizationFilter) {
+            $query->excludeContract()->limit(10);
+        }
 
         if ($hasOrganizationFilter) {
             $query
@@ -229,8 +233,6 @@ class EmployeeController extends Controller
                 })
                 ->with('organizationAssignment:id,company_id,department_id,sub_department_id')
                 ->orderBy('full_name');
-        } else {
-            $query->limit(10);
         }
 
         if ($search) {
